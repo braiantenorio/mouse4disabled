@@ -3,14 +3,13 @@
 #include <Adafruit_Sensor.h>
 #include <BleMouse.h>
 
-float MIN_SENSITIVITY = 30.0;
-float MAX_SENSITIVITY = 40.0;
-float ACCEL_THRESHOLD = 1.5;
+float MIN_SENSITIVITY = 25.0;
+float MAX_SENSITIVITY = 35.0;
+float ACCEL_THRESHOLD = 2.0; //1.5
 
 float SMOOTHING_ALPHA = 0.2;
-float GYRO_DEADZONE = 0.05;
+float GYRO_DEADZONE = 0.01;
 
-bool VERTICAL_MODE = false;
 bool INVERT_X = true;
 bool INVERT_Y = false;
 
@@ -19,11 +18,30 @@ BleMouse bleMouse("ESP32 Air Mouse");
 
 float gyroX_offset = 0, gyroY_offset = 0, gyroZ_offset = 0;
 float smoothX = 0, smoothY = 0;
-unsigned long freezeEndTime = 0;
+
+enum GestureState {
+  IDLE,
+  ROTATING,
+  WAIT_RETURN
+};
+
+GestureState gestureState = IDLE;
+
+float gestureAngle = 0.0;  // grados
+int gestureDirection = 0;
+unsigned long lastClickTime = 0;
+
+const float DELTA_TIME = 0.01;  // 10 ms
+const float START_THRESHOLD = 1.2;
+const float CLICK_ANGLE = 18.0;
+const float RETURN_ANGLE = 5.0;
+const float RETURN_SPEED = -0.3;
+const float DOMINANCE_FACTOR = 1.5;
+const unsigned long CLICK_COOLDOWN = 1000;
+
 
 // tasks
 TaskHandle_t MouseTaskHandle = NULL;
-
 
 float mapFloat(float x, float in_min, float in_max, float out_min, float out_max) {
   return (x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min;
@@ -53,7 +71,6 @@ void calibrateGyro() {
 void mouseTask(void *pvParameters) {
 
   while (true) {
-
     if (!bleMouse.isConnected()) {
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
@@ -70,59 +87,80 @@ void mouseTask(void *pvParameters) {
     if (abs(rawY) < GYRO_DEADZONE) rawY = 0;
     if (abs(rawZ) < GYRO_DEADZONE) rawZ = 0;
 
-    static unsigned long lastPrint = 0;
+    // -------------------------
+    // Detección del gesto
+    // -------------------------
 
-    if (millis() - lastPrint > 200) {
-      Serial.printf(
-        "rawX=%.3f rawY=%.3f rawZ=%.3f\n",
-        rawX,
-        rawY,
-        rawZ);
-      lastPrint = millis();
+    bool yDominant =
+      abs(rawY) > START_THRESHOLD && abs(rawY) > abs(rawX) * DOMINANCE_FACTOR && abs(rawY) > abs(rawZ) * DOMINANCE_FACTOR;
+
+    switch (gestureState) {
+      case IDLE:
+        gestureAngle = 0;
+
+        if (yDominant) {
+          gestureDirection = (rawY > 0) ? 1 : -1;
+          gestureAngle = 0;
+          gestureState = ROTATING;
+        }
+
+        break;
+
+      case ROTATING:
+        gestureAngle += abs(rawY) * DELTA_TIME * 180.0 / PI;
+
+        // Cancelar si dejó de ser dominante
+        if (!yDominant) {
+          gestureState = IDLE;
+          break;
+        }
+
+        if (gestureAngle >= CLICK_ANGLE && millis() - lastClickTime >= CLICK_COOLDOWN) {
+
+          //bleMouse.click(MOUSE_LEFT);
+
+          if (gestureDirection > 0)
+            bleMouse.click(MOUSE_LEFT);
+          else
+            bleMouse.click(MOUSE_RIGHT);
+
+          lastClickTime = millis();
+
+          gestureState = WAIT_RETURN;
+        }
+
+        break;
+
+      case WAIT_RETURN:  // cambiar cooldown?
+
+        gestureAngle -= abs(rawY) * DELTA_TIME * 180.0 / PI;
+
+        // Esperar a volver cerca del origen
+        if (gestureDirection > 0) {
+          // El gesto fue positivo, así que el regreso debe ser negativo.
+          if (gestureAngle <= RETURN_ANGLE && rawY < RETURN_SPEED)
+            gestureState = IDLE;
+        } else {
+          // El gesto fue negativo, así que el regreso debe ser positivo.
+          if (gestureAngle <= RETURN_ANGLE && rawY > -RETURN_SPEED)
+            gestureState = IDLE;
+        }
+        break;
     }
 
-    float xyMagnitude = sqrt(rawX * rawX + rawZ * rawZ);
-
-    static unsigned long lastClickTime = 0;
-    const unsigned long CLICK_COOLDOWN = 500;  // ms
-
-    if (abs(rawY) > xyMagnitude * 2.0 && abs(rawY) > 1.5 && millis() - lastClickTime > CLICK_COOLDOWN) {
-
-      // Congelar el cursor un instante
-      freezeEndTime = millis() + 200;
-
-      // Click izquierdo
-      bleMouse.click(MOUSE_LEFT);
-
-      lastClickTime = millis();
-    }
-
-    float activeX = 0;
-    float activeY = 0;
-
-    if (VERTICAL_MODE) {
-      activeX = rawX;
-      activeY = rawZ;
-    } else {
+    // --- Movimiento del cursor (solo si no hay gesto activo) ---
+    float activeX = 0, activeY = 0;
+    if (gestureState == IDLE) {
       activeX = rawZ;
       activeY = rawX;
     }
 
     float velocity = sqrt(activeX * activeX + activeY * activeY);
-
     float sensitivity = MIN_SENSITIVITY;
-
     if (velocity > 0.1) {
-
-      sensitivity = mapFloat(
-        velocity,
-        0,
-        ACCEL_THRESHOLD,
-        MIN_SENSITIVITY,
-        MAX_SENSITIVITY);
-
-      if (sensitivity > MAX_SENSITIVITY)
-        sensitivity = MAX_SENSITIVITY;
+      sensitivity = mapFloat(velocity, 0, ACCEL_THRESHOLD,
+                             MIN_SENSITIVITY, MAX_SENSITIVITY);
+      if (sensitivity > MAX_SENSITIVITY) sensitivity = MAX_SENSITIVITY;
     }
 
     float targetMoveX = activeX * sensitivity;
@@ -137,12 +175,7 @@ void mouseTask(void *pvParameters) {
     if (INVERT_X) finalX = -finalX;
     if (INVERT_Y) finalY = -finalY;
 
-    bool movementAllowed = true;
-
-    if (millis() < freezeEndTime)
-      movementAllowed = false;
-
-    if (movementAllowed && (finalX != 0 || finalY != 0)) {
+    if (gestureState == IDLE && (finalX != 0 || finalY != 0)) {
       bleMouse.move(finalX, finalY);
     }
 
@@ -152,10 +185,8 @@ void mouseTask(void *pvParameters) {
 
 
 void setup() {
-
   Serial.begin(115200);
   Wire.begin(21, 22);
-
 
   if (!mpu.begin()) {
     Serial.println("MPU6050 not found!");
@@ -170,8 +201,6 @@ void setup() {
   delay(1000);
 
   calibrateGyro();
-
-  Serial.println("Go!");
 
   bleMouse.begin();
 
